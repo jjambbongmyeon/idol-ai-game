@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>플레이어 참여형 아이돌 육성 게임 - Prototype</title>
+  <!-- TensorFlow.js & MoveNet (모션 인식 AI) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+  <style>
+    body { font-family: sans-serif; background: #222; color: #fff; margin: 20px; }
+    h1 { color: #ff69b4; }
+    .container { display: flex; gap: 20px; }
+    .display-box { position: relative; width: 640px; height: 480px; border: 2px solid #555; background: #000; }
+    video, canvas { position: absolute; top: 0; left: 0; width: 640px; height: 480px; transform: scaleX(-1); }
+    .controls { margin-top: 15px; }
+    button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #ff69b4; border: none; color: white; border-radius: 5px; }
+    button:disabled { background: #555; cursor: not-allowed; }
+    .status-panel { flex: 1; background: #333; padding: 20px; border-radius: 8px; }
+    .stat { font-size: 18px; margin: 10px 0; }
+    .guide { background: #444; padding: 10px; margin-top: 10px; border-radius: 4px; border-left: 4px solid #ff69b4; }
+    .meter-bar { width: 100%; background: #555; height: 20px; border-radius: 10px; overflow: hidden; margin-top: 5px; }
+    .meter-fill { height: 100%; width: 0%; background: #00ffcc; transition: width 0.1s; }
+  </style>
+</head>
+<body>
+
+  <h1>🎤 아이돌 육성 프로토타입 (AI 음성 & 모션 인식)</h1>
+
+  <div class="container">
+    <div class="display-box">
+      <video id="webcam" width="640" height="480" autoplay playsinline></video>
+      <canvas id="canvas" width="640" height="480"></canvas>
+    </div>
+
+    <div class="status-panel">
+      <h2>📊 아이돌 능력치 & 실시간 측정</h2>
+      <div class="stat">🎤 보컬 스탯: <span id="vocal-stat">0</span> / 100</div>
+      <div class="stat">💃 댄스 스탯: <span id="dance-stat">0</span> / 100</div>
+      <hr>
+      <div class="guide">
+        <h3>🎯 가이드 미션 (따라 하세요!)</h3>
+        <p><strong>[노래]</strong> 높은 소리로 "아~" 소리를 내세요!</p>
+        <p><strong>[동작]</strong> <span id="current-gesture" style="color:#00ffcc; font-weight:bold;">오른손을 머리 위로 올리세요!</span></p>
+      </div>
+     
+      <div style="margin-top: 15px;">
+        <label>🎤 실시간 피치/성량 반응도:</label>
+        <div class="meter-bar"><div id="pitch-meter" class="meter-fill"></div></div>
+      </div>
+      <div style="margin-top: 15px;">
+        <label>💃 실시간 포즈 정확도:</label>
+        <div class="meter-bar"><div id="pose-meter" class="meter-fill" style="background:#ff69b4;"></div></div>
+      </div>
+     
+      <div class="controls">
+        <button id="start-btn">연습 시작하기 (장비 권한 필요)</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let detector;
+    let audioCtx, analyser, microphone, stream;
+    let isTesting = false;
+
+    // 아이돌 스탯
+    let vocalStat = 0;
+    let danceStat = 0;
+
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const startBtn = document.getElementById('start-btn');
+
+    // 1. MoveNet 모델 초기화
+    async function initPoseDetection() {
+      const model = poseDetection.SupportedModels.MoveNet;
+      detector = await poseDetection.createDetector(model, {
+        modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING
+      });
+    }
+
+    // 2. 웹캠 및 마이크 활성화
+    async function initSensors() {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480 },
+        audio: true
+      });
+      video.srcObject = stream;
+
+      // 오디오 분석기 세팅 (Pitch/Volume 탐지)
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioCtx.createAnalyser();
+      microphone = audioCtx.createMediaStreamSource(stream);
+      microphone.connect(analyser);
+      analyser.fftSize = 512;
+
+      return new Promise((resolve) => {
+        video.onloadedmetadata = () => resolve();
+      });
+    }
+
+    // 3. 루프 실행 (마이크 & 댄스 판정)
+    async function gameLoop() {
+      if (!isTesting) return;
+
+      // --- [A] 음성(보컬) 판정 ---
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(dataArray);
+     
+      // 평균 음량 및 고음역대 에너지 계산
+      let sum = 0;
+      let highPitchSum = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        sum += dataArray[i];
+        if (i > dataArray.length / 2) highPitchSum += dataArray[i];
+      }
+      let avgVolume = sum / dataArray.length;
+      let vocalScore = Math.min(100, Math.floor((avgVolume / 128) * 100));
+
+      document.getElementById('pitch-meter').style.width = vocalScore + '%';
+     
+      if (vocalScore > 40) {
+        vocalStat = Math.min(100, vocalStat + 0.1);
+        document.getElementById('vocal-stat').innerText = vocalStat.toFixed(1);
+      }
+
+      // --- [B] 모션(댄스) 판정 ---
+      const poses = await detector.estimatePoses(video);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      let danceScore = 0;
+      if (poses.length > 0) {
+        const keypoints = poses[0].keypoints;
+        drawKeypoints(keypoints);
+
+        // 예시 동작 판정: 오른손(right_wrist)이 머리/눈(right_eye)보다 위에 있는지 판정
+        const rightWrist = keypoints.find(k => k.name === 'right_wrist');
+        const rightEye = keypoints.find(k => k.name === 'right_eye');
+
+        // Note: 웹캠이 좌우반전(Mirror)되어 있으므로 좌표 조심
+        if (rightWrist && rightEye && rightWrist.score > 0.3 && rightEye.score > 0.3) {
+          if (rightWrist.y < rightEye.y) {
+            danceScore = 100; // 목표 포즈 성공
+            danceStat = Math.min(100, danceStat + 0.2);
+            document.getElementById('dance-stat').innerText = danceStat.toFixed(1);
+          } else {
+            // 손을 올리는 높이에 비례하여 점수 부여
+            let diff = Math.max(0, rightEye.y - rightWrist.y);
+            danceScore = Math.min(90, Math.floor((1 - diff / 200) * 100));
+          }
+        }
+      }
+
+      document.getElementById('pose-meter').style.width = danceScore + '%';
+
+      requestAnimationFrame(gameLoop);
+    }
+
+    // 키포인트 시각화 (뼈대 그리기)
+    function drawKeypoints(keypoints) {
+      keypoints.forEach(point => {
+        if (point.score > 0.3) {
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, 6, 0, 2 * Math.PI);
+          ctx.fillStyle = '#00ffcc';
+          ctx.fill();
+        }
+      });
+    }
+
+    // 이벤트 리스너
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true;
+      startBtn.innerText = 'AI 모델 및 카메라 로딩 중...';
+     
+      await initPoseDetection();
+      await initSensors();
+
+      startBtn.innerText = '육성 진행 중...';
+      isTesting = true;
+      gameLoop();
+    });
+  </script>
+</body>
+</html>
